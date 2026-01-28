@@ -1,0 +1,11 @@
+"filename", "language", "Python", "comment", "blank", "total"
+"d:\python\recon\config.py", "Python", 99, 3, 14, 116
+"d:\python\recon\main.py", "Python", 77, 0, 8, 85
+"d:\python\recon\ochestrator.py", "Python", 121, 9, 23, 153
+"d:\python\recon\scanner\base.py", "Python", 43, 0, 8, 51
+"d:\python\recon\scanner\vulnerability.py", "Python", 147, 16, 44, 207
+"d:\python\recon\scanner\waf_delector.py", "Python", 137, 17, 36, 190
+"d:\python\recon\utils\cache.py", "Python", 26, 0, 6, 32
+"d:\python\recon\utils\proxy_manager.py", "Python", 70, 0, 12, 82
+"d:\python\recon\utils\rate_limiter.py", "Python", 24, 0, 2, 26
+"Total", "-", 744, 45, 153, 942
